@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { CheckCircle, Music, RefreshCw, ArrowUp, Globe, TrendingUp, TrendingDown, X } from 'lucide-react';
+import { CheckCircle, Music, RefreshCw, ArrowUp, Globe, TrendingUp, TrendingDown, X, Settings } from 'lucide-react';
 import { autoCorrelate } from './utils/pitchDetection';
 import { NOTES, MODES, STRING_TUNING, getSections } from './constants/music';
 import { TRANSLATIONS } from './constants/translations';
@@ -44,6 +44,9 @@ export default function App() {
   const [liveMetrics, setLiveMetrics] = useState({ space: 0, stability: 0, volume: 0 });
   const [fretboardCollapsed, setFretboardCollapsed] = useState(true);
   const [isLandscape, setIsLandscape] = useState(window.innerWidth > window.innerHeight);
+  const [noteHoldTime, setNoteHoldTime] = useState(3000);
+  const [showSettings, setShowSettings] = useState(false);
+  const [harmonicsLog, setHarmonicsLog] = useState([]);
 
   useEffect(() => {
     const handleResize = () => {
@@ -186,15 +189,11 @@ export default function App() {
             lastTimestampRef.current = null;
             
             if (skipAccumulatedTimeRef.current >= 100) {
-               setFailedInPhase('FULL_RUN');
-               setFailureReason(`FULL_RUN: Wrong note for 100ms. Expected "${fullRunSequence[fullRunIndex]}" but detected "${currentNote.name}${currentNote.octave}" (${currentNote.cents > 0 ? '+' : ''}${currentNote.cents}c). Semi dist=${semiDist}`);
-               setSequencePhase('FAILED');
-               accumulatedTimeRef.current = 0;
-               setProgressPercent(0);
-               lastTimestampRef.current = null;
+               const logEntry = { time: new Date().toLocaleTimeString(), phase: 'FULL_RUN', expected: fullRunSequence[fullRunIndex], detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, semiDist, freq: detectedFreq };
+               console.warn('[Harmonics]', logEntry);
+               setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
                skipAccumulatedTimeRef.current = 0;
                skipLastTimestampRef.current = null;
-               return;
             }
          }
          
@@ -234,17 +233,13 @@ export default function App() {
          
          skipLastTimestampRef.current = now;
          
-         // Fail after 100ms of consecutive skip detection
+         // Log instead of failing - suspected harmonic/skip
          if (skipAccumulatedTimeRef.current >= 100) {
-            setFailedInPhase('DISCOVERY');
-            setFailureReason(`DISCOVERY: Skipped ahead. Expected "${expectedNote}" (index ${highestUnlockedIndex}) but detected "${currentNote.name}${currentNote.octave}" (${currentNote.cents > 0 ? '+' : ''}${currentNote.cents}c) which appears ahead in scale. Skip time: ${skipAccumulatedTimeRef.current.toFixed(0)}ms`);
-            setSequencePhase('FAILED');
-            accumulatedTimeRef.current = 0;
-            setProgressPercent(0);
-            lastTimestampRef.current = null;
+            const logEntry = { time: new Date().toLocaleTimeString(), phase: 'DISCOVERY', expected: expectedNote, detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, freq: detectedFreq, reason: 'skip_ahead' };
+            console.warn('[Harmonics]', logEntry);
+            setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
             skipAccumulatedTimeRef.current = 0;
             skipLastTimestampRef.current = null;
-            return;
          }
          
          animationFrameId = requestAnimationFrame(trackTime);
@@ -272,18 +267,13 @@ export default function App() {
       // This means the player isn't actually ascending to the new note
       if (highestUnlockedIndex > 0 && totalDetectionsRef.current >= 120) {
          if (prevNoteDetectionsRef.current > targetDetectionsRef.current * 3) {
-            setFailedInPhase('DISCOVERY');
-            setFailureReason(`DISCOVERY: Previous notes dominate. Expected "${expectedNote}" (index ${highestUnlockedIndex}). Target detections: ${targetDetectionsRef.current}, Prev note detections: ${prevNoteDetectionsRef.current}, Total: ${totalDetectionsRef.current}. Currently hearing: "${currentNote.name}${currentNote.octave}"`);
-            setSequencePhase('FAILED');
-            accumulatedTimeRef.current = 0;
-            setProgressPercent(0);
-            lastTimestampRef.current = null;
-            skipAccumulatedTimeRef.current = 0;
-            skipLastTimestampRef.current = null;
+            const logEntry = { time: new Date().toLocaleTimeString(), phase: 'DISCOVERY', expected: expectedNote, detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, freq: detectedFreq, reason: 'prev_dominates', targetCount: targetDetectionsRef.current, prevCount: prevNoteDetectionsRef.current, total: totalDetectionsRef.current };
+            console.warn('[Harmonics]', logEntry);
+            setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
+            // Reset counters and let user continue
             targetDetectionsRef.current = 0;
             prevNoteDetectionsRef.current = 0;
             totalDetectionsRef.current = 0;
-            return;
          }
       }
 
@@ -296,16 +286,16 @@ export default function App() {
             // Only accumulate if delta is reasonable (< 100ms to avoid big jumps)
             if (delta < 100) {
                accumulatedTimeRef.current += delta;
-               // Octave (index 7) only needs 200ms, others need 3000ms
-               const requiredTime = highestUnlockedIndex === 7 ? 200 : 3000;
+               // Octave (index 7) only needs 200ms, others use configured time
+               const requiredTime = highestUnlockedIndex === 7 ? 200 : noteHoldTime;
                setProgressPercent(Math.min(100, (accumulatedTimeRef.current / requiredTime) * 100));
             }
          }
          
          lastTimestampRef.current = now;
          
-         // Octave (index 7) only needs 200ms, others need 3000ms
-         const requiredTime = highestUnlockedIndex === 7 ? 200 : 3000;
+         // Octave (index 7) only needs 200ms, others use configured time
+         const requiredTime = highestUnlockedIndex === 7 ? 200 : noteHoldTime;
          if (accumulatedTimeRef.current >= requiredTime) {
             accumulatedTimeRef.current = 0; // Reset for next note
             lastTimestampRef.current = null;
@@ -340,7 +330,7 @@ export default function App() {
         cancelAnimationFrame(animationFrameId);
       }
     };
-  }, [currentNote, highestUnlockedIndex, sequencePhase, scaleNotes, activeTab, fullRunIndex, fullRunSequence]);
+  }, [currentNote, highestUnlockedIndex, sequencePhase, scaleNotes, activeTab, fullRunIndex, fullRunSequence, noteHoldTime]);
 
   // --- Timer Logic ---
   useEffect(() => {
@@ -481,7 +471,24 @@ export default function App() {
                 <button onClick={resetScaleTracking} className="p-2 bg-zinc-800 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-700 transition-all" title={txt.resetScale}>
                   <RefreshCw className="w-5 h-5" />
                 </button>
+                <button onClick={() => setShowSettings(prev => !prev)} className={`p-2 rounded-lg transition-all ${showSettings ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-400 hover:text-white hover:bg-zinc-700'}`} title={lang === 'he' ? 'הגדרות' : 'Settings'}>
+                  <Settings className="w-5 h-5" />
+                </button>
               </div>
+
+              {/* Settings Panel */}
+              {showSettings && (
+                <div className="bg-zinc-900 border border-amber-500/30 p-3 lg:p-4 rounded-2xl flex flex-wrap items-center gap-3 lg:gap-4">
+                  <label className="text-xs lg:text-sm text-zinc-400 font-bold">{lang === 'he' ? 'זמן שהייה על תו:' : 'Note hold time:'}</label>
+                  <div className="flex gap-1.5">
+                    {[1000, 2000, 3000, 5000, 7000, 10000].map(ms => (
+                      <button key={ms} onClick={() => setNoteHoldTime(ms)} className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${noteHoldTime === ms ? 'bg-amber-500 text-black' : 'bg-zinc-800 text-zinc-400 hover:bg-zinc-700'}`}>
+                        {ms / 1000}s
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Scale Sequences Display */}
               <div className="bg-gradient-to-br from-zinc-900 to-black border border-amber-500/30 p-3 lg:p-6 rounded-2xl lg:rounded-3xl relative overflow-hidden flex flex-col gap-4 lg:gap-6 shadow-[0_0_30px_rgba(245,158,11,0.05)]">
@@ -514,7 +521,7 @@ export default function App() {
                         {/* Debug info */}
                         {sequencePhase === 'DISCOVERY' && (
                            <div className="text-xs text-zinc-500 font-mono flex flex-col gap-0.5 min-h-[3.5rem]">
-                              <div>Progress: {progressPercent.toFixed(0)}% ({accumulatedTimeRef.current.toFixed(0)}ms / 3000ms)</div>
+                              <div>Progress: {progressPercent.toFixed(0)}% ({accumulatedTimeRef.current.toFixed(0)}ms / {noteHoldTime}ms)</div>
                               {detectedFreq && <div className="text-[10px]">Freq: {detectedFreq}Hz | Detected: {currentNote?.name}{currentNote?.octave} ({currentNote?.cents > 0 ? '+' : ''}{currentNote?.cents}c)</div>}
                               {skipAccumulatedTimeRef.current > 0 && (
                                 <div className="text-orange-500 text-[10px]">
@@ -744,6 +751,31 @@ export default function App() {
                 </div>
                 )}
               </div>
+
+              {/* Harmonics Detection Log */}
+              {harmonicsLog.length > 0 && (
+              <div className="bg-zinc-900/50 border border-orange-500/20 rounded-2xl overflow-hidden shrink-0">
+                <button onClick={() => setHarmonicsLog([])} className="w-full p-3 border-b border-zinc-800 bg-zinc-900/80 flex items-center justify-between hover:bg-zinc-800/80 transition-colors">
+                  <h3 className="text-orange-400 text-xs font-bold uppercase tracking-wider flex items-center gap-2">
+                    🎵 {lang === 'he' ? `יומן הרמוניות (${harmonicsLog.length})` : `Harmonics Log (${harmonicsLog.length})`}
+                  </h3>
+                  <span className="text-zinc-500 text-xs">{lang === 'he' ? 'נקה' : 'Clear'}</span>
+                </button>
+                <div className="max-h-32 overflow-y-auto p-2 flex flex-col gap-1">
+                  {harmonicsLog.map((entry, i) => (
+                    <div key={i} className="text-[10px] font-mono text-orange-400/70 bg-orange-950/20 rounded px-2 py-1 flex flex-wrap gap-2">
+                      <span className="text-zinc-500">{entry.time}</span>
+                      <span className="text-orange-400">{entry.phase}</span>
+                      <span>exp:<span className="text-amber-400">{entry.expected}</span></span>
+                      <span>got:<span className="text-red-400">{entry.detected}</span></span>
+                      <span className="text-zinc-500">{entry.cents > 0 ? '+' : ''}{entry.cents}c</span>
+                      {entry.freq && <span className="text-zinc-500">{entry.freq}Hz</span>}
+                      {entry.reason && <span className="text-zinc-600">[{entry.reason}]</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+              )}
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-3 shrink-0">
