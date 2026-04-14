@@ -46,7 +46,8 @@ export default function App() {
   const [isLandscape, setIsLandscape] = useState(window.innerWidth > window.innerHeight);
   const [noteHoldTime, setNoteHoldTime] = useState(3000);
   const [showSettings, setShowSettings] = useState(false);
-  const [harmonicsLog, setHarmonicsLog] = useState([]);
+  const [harmonicsLog, setHarmonicsLog] = useState([]); // keeping for future use
+  const noteHistoryRef = useRef([]); // ring buffer for stability filter
 
   useEffect(() => {
     const handleResize = () => {
@@ -189,11 +190,15 @@ export default function App() {
             lastTimestampRef.current = null;
             
             if (skipAccumulatedTimeRef.current >= 100) {
-               const logEntry = { time: new Date().toLocaleTimeString(), phase: 'FULL_RUN', expected: fullRunSequence[fullRunIndex], detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, semiDist, freq: detectedFreq };
-               console.warn('[Harmonics]', logEntry);
-               setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
+               setFailedInPhase('FULL_RUN');
+               setFailureReason(`FULL_RUN: Wrong note for 100ms. Expected "${fullRunSequence[fullRunIndex]}" but detected "${currentNote.name}${currentNote.octave}" (${currentNote.cents > 0 ? '+' : ''}${currentNote.cents}c). Semi dist=${semiDist}`);
+               setSequencePhase('FAILED');
+               accumulatedTimeRef.current = 0;
+               setProgressPercent(0);
+               lastTimestampRef.current = null;
                skipAccumulatedTimeRef.current = 0;
                skipLastTimestampRef.current = null;
+               return;
             }
          }
          
@@ -233,13 +238,17 @@ export default function App() {
          
          skipLastTimestampRef.current = now;
          
-         // Log instead of failing - suspected harmonic/skip
+         // Fail after 100ms of consecutive skip detection
          if (skipAccumulatedTimeRef.current >= 100) {
-            const logEntry = { time: new Date().toLocaleTimeString(), phase: 'DISCOVERY', expected: expectedNote, detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, freq: detectedFreq, reason: 'skip_ahead' };
-            console.warn('[Harmonics]', logEntry);
-            setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
+            setFailedInPhase('DISCOVERY');
+            setFailureReason(`DISCOVERY: Skipped ahead. Expected "${expectedNote}" (index ${highestUnlockedIndex}) but detected "${currentNote.name}${currentNote.octave}" (${currentNote.cents > 0 ? '+' : ''}${currentNote.cents}c) which appears ahead in scale. Skip time: ${skipAccumulatedTimeRef.current.toFixed(0)}ms`);
+            setSequencePhase('FAILED');
+            accumulatedTimeRef.current = 0;
+            setProgressPercent(0);
+            lastTimestampRef.current = null;
             skipAccumulatedTimeRef.current = 0;
             skipLastTimestampRef.current = null;
+            return;
          }
          
          animationFrameId = requestAnimationFrame(trackTime);
@@ -267,13 +276,18 @@ export default function App() {
       // This means the player isn't actually ascending to the new note
       if (highestUnlockedIndex > 0 && totalDetectionsRef.current >= 120) {
          if (prevNoteDetectionsRef.current > targetDetectionsRef.current * 3) {
-            const logEntry = { time: new Date().toLocaleTimeString(), phase: 'DISCOVERY', expected: expectedNote, detected: `${currentNote.name}${currentNote.octave}`, cents: currentNote.cents, freq: detectedFreq, reason: 'prev_dominates', targetCount: targetDetectionsRef.current, prevCount: prevNoteDetectionsRef.current, total: totalDetectionsRef.current };
-            console.warn('[Harmonics]', logEntry);
-            setHarmonicsLog(prev => [logEntry, ...prev].slice(0, 100));
-            // Reset counters and let user continue
+            setFailedInPhase('DISCOVERY');
+            setFailureReason(`DISCOVERY: Previous notes dominate. Expected "${expectedNote}" (index ${highestUnlockedIndex}). Target detections: ${targetDetectionsRef.current}, Prev note detections: ${prevNoteDetectionsRef.current}, Total: ${totalDetectionsRef.current}. Currently hearing: "${currentNote.name}${currentNote.octave}"`);
+            setSequencePhase('FAILED');
+            accumulatedTimeRef.current = 0;
+            setProgressPercent(0);
+            lastTimestampRef.current = null;
+            skipAccumulatedTimeRef.current = 0;
+            skipLastTimestampRef.current = null;
             targetDetectionsRef.current = 0;
             prevNoteDetectionsRef.current = 0;
             totalDetectionsRef.current = 0;
+            return;
          }
       }
 
@@ -375,13 +389,28 @@ export default function App() {
 
         const freq = autoCorrelate(floatDataArray, audioContextRef.current.sampleRate);
         if (freq !== -1 && freq > 40 && freq < 2000) {
-            setDetectedFreq(Math.round(freq));
             const noteNum = 12 * (Math.log(freq / 440) / Math.log(2));
             const noteIndex = Math.round(noteNum) + 69;
             const cents = Math.round((noteNum - Math.round(noteNum)) * 100);
             const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-            setCurrentNote({ name: noteNames[noteIndex % 12], octave: Math.floor(noteIndex / 12) - 1, cents });
+            const detectedName = noteNames[noteIndex % 12];
+
+            // 3-frame stability filter: only commit a note when ≥2 of last 3 frames agree.
+            // This kills single-frame harmonic/overtone false positives.
+            const history = noteHistoryRef.current;
+            history.push(detectedName);
+            if (history.length > 3) history.shift();
+
+            const counts = {};
+            history.forEach(n => { counts[n] = (counts[n] || 0) + 1; });
+            const [winner, winCount] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+
+            if (winCount >= 2) {
+              setDetectedFreq(Math.round(freq));
+              setCurrentNote({ name: winner, octave: Math.floor(noteIndex / 12) - 1, cents });
+            }
         } else {
+            noteHistoryRef.current = [];
             setCurrentNote(null);
             setDetectedFreq(null);
         }
@@ -751,31 +780,6 @@ export default function App() {
                 </div>
                 )}
               </div>
-
-              {/* Harmonics Detection Log */}
-              {harmonicsLog.length > 0 && (
-              <div className="bg-zinc-900/50 border border-orange-500/20 rounded-2xl overflow-hidden shrink-0">
-                <button onClick={() => setHarmonicsLog([])} className="w-full p-3 border-b border-zinc-800 bg-zinc-900/80 flex items-center justify-between hover:bg-zinc-800/80 transition-colors">
-                  <h3 className="text-orange-400 text-xs font-bold uppercase tracking-wider flex items-center gap-2">
-                    🎵 {lang === 'he' ? `יומן הרמוניות (${harmonicsLog.length})` : `Harmonics Log (${harmonicsLog.length})`}
-                  </h3>
-                  <span className="text-zinc-500 text-xs">{lang === 'he' ? 'נקה' : 'Clear'}</span>
-                </button>
-                <div className="max-h-32 overflow-y-auto p-2 flex flex-col gap-1">
-                  {harmonicsLog.map((entry, i) => (
-                    <div key={i} className="text-[10px] font-mono text-orange-400/70 bg-orange-950/20 rounded px-2 py-1 flex flex-wrap gap-2">
-                      <span className="text-zinc-500">{entry.time}</span>
-                      <span className="text-orange-400">{entry.phase}</span>
-                      <span>exp:<span className="text-amber-400">{entry.expected}</span></span>
-                      <span>got:<span className="text-red-400">{entry.detected}</span></span>
-                      <span className="text-zinc-500">{entry.cents > 0 ? '+' : ''}{entry.cents}c</span>
-                      {entry.freq && <span className="text-zinc-500">{entry.freq}Hz</span>}
-                      {entry.reason && <span className="text-zinc-600">[{entry.reason}]</span>}
-                    </div>
-                  ))}
-                </div>
-              </div>
-              )}
             </div>
           ) : (
             <div className="grid grid-cols-3 gap-3 shrink-0">
